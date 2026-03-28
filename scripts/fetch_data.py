@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-個股期貨資料爬蟲 v2
-改用台灣期交所（TAIFEX）官方公開 API
-每日計算成交量遞增前 20 名
+個股期貨資料爬蟲 v3
+- 改用台灣期交所（TAIFEX）官方公開 API
+- 支援補抓歷史資料：設定 BACKFILL_START / BACKFILL_END 環境變數
+- 每日計算成交量遞增前 20 名
 """
 
 import json
@@ -25,18 +26,14 @@ HEADERS = {
     'Referer': 'https://www.taifex.com.tw/',
 }
 
-# 期交所個股期貨日交易資料 API
-# queryType=2 = 個股期貨, queryDate = YYYY/MM/DD
-TAIFEX_API = (
-    'https://www.taifex.com.tw/cht/3/futDataDown'
-    '?down_type=1&queryStartDate={date}&queryEndDate={date}'
-    '&commodity_id=SF'
-)
-
-# 備用：期交所開放資料 JSON API
 TAIFEX_JSON_API = (
     'https://opendata.taifex.com.tw/v1/DailyFuturesDate'
     '?MarketCode=0&CommodityID=SF&Date={date_nodash}'
+)
+TAIFEX_CSV_API = (
+    'https://www.taifex.com.tw/cht/3/futDataDown'
+    '?down_type=1&queryStartDate={date}&queryEndDate={date}'
+    '&commodity_id=SF'
 )
 
 
@@ -78,55 +75,65 @@ def safe_float(s):
         return None
 
 
-# ── 方法一：期交所開放資料 JSON API ──────────────────────
+# ── 取得日期範圍內所有工作日 ──────────────────────────────
+def get_weekdays(start_str, end_str):
+    """回傳 start ~ end 之間所有週一至週五的日期字串清單"""
+    tz = datetime.timezone(datetime.timedelta(hours=8))
+    start = datetime.datetime.strptime(start_str, '%Y-%m-%d').replace(tzinfo=tz)
+    end   = datetime.datetime.strptime(end_str,   '%Y-%m-%d').replace(tzinfo=tz)
+    days  = []
+    cur   = start
+    while cur <= end:
+        if cur.weekday() < 5:  # 0=Monday, 4=Friday
+            days.append(cur.strftime('%Y-%m-%d'))
+        cur += datetime.timedelta(days=1)
+    return days
+
+
+# ── API 方法一：期交所 JSON 開放資料 ─────────────────────
 def fetch_taifex_opendata(date_str):
-    """
-    date_str: '2025-01-15'
-    回傳 list of dict，每筆為一個個股期貨契約
-    """
     date_nodash = date_str.replace('-', '')
     url = TAIFEX_JSON_API.format(date_nodash=date_nodash)
-    print(f'[API-1] 嘗試期交所開放資料：{url}')
+    print(f'  [API-1] {url}')
     try:
         resp = requests.get(url, headers=HEADERS, timeout=30)
         resp.raise_for_status()
         data = resp.json()
-        print(f'[API-1] 回傳 {len(data)} 筆')
+        if not isinstance(data, list) or len(data) == 0:
+            return []
         records = []
         for row in data:
-            vol = safe_float(row.get('Volume') or row.get('TradingVolume') or row.get('volume'))
+            vol  = None
+            for k in row:
+                if any(x in k.lower() for x in ['vol', 'volume', '成交量']):
+                    vol = safe_float(row[k])
+                    if vol is not None:
+                        break
             name = (row.get('ContractName') or row.get('Name') or
-                    row.get('CommodityName') or row.get('name') or '')
+                    row.get('CommodityName') or '')
             code = (row.get('ContractCode') or row.get('Code') or
-                    row.get('CommodityID') or row.get('code') or '')
-            price = safe_float(row.get('SettlementPrice') or row.get('Close') or
-                               row.get('close') or row.get('price'))
-            oi = safe_float(row.get('OpenInterest') or row.get('openInterest'))
+                    row.get('CommodityID') or '')
+            price = safe_float(row.get('SettlementPrice') or
+                               row.get('Close') or row.get('close'))
+            oi    = safe_float(row.get('OpenInterest') or row.get('openInterest'))
             if not name or vol is None:
                 continue
-            records.append({
-                'code':          code,
-                'name':          name,
-                'volume':        vol,
-                'price':         price,
-                'open_interest': oi,
-            })
+            records.append({'code': code, 'name': name, 'volume': vol,
+                            'price': price, 'open_interest': oi})
         return records
     except Exception as e:
-        print(f'[API-1] 失敗：{e}')
+        print(f'  [API-1] 失敗：{e}')
         return []
 
 
-# ── 方法二：期交所每日行情下載（CSV 格式）─────────────────
+# ── API 方法二：期交所 CSV 下載 ───────────────────────────
 def fetch_taifex_csv(date_str):
-    """備用方案：下載期交所 CSV 日行情"""
     date_slash = date_str.replace('-', '/')
-    url = TAIFEX_API.format(date=date_slash)
-    print(f'[API-2] 嘗試期交所 CSV：{url}')
+    url = TAIFEX_CSV_API.format(date=date_slash)
+    print(f'  [API-2] {url}')
     try:
         resp = requests.get(url, headers=HEADERS, timeout=30)
         resp.raise_for_status()
-        # 嘗試用 big5 / utf-8 解碼
         for enc in ('big5', 'utf-8-sig', 'utf-8'):
             try:
                 text = resp.content.decode(enc)
@@ -135,84 +142,31 @@ def fetch_taifex_csv(date_str):
                 continue
         else:
             text = resp.text
-
         records = []
-        lines = text.strip().split('\n')
-        print(f'[API-2] 取得 {len(lines)} 行')
-        # 跳過標頭，解析資料行
-        for line in lines[1:]:
+        for line in text.strip().split('\n')[1:]:
             cols = [c.strip().strip('"') for c in line.split(',')]
-            if len(cols) < 6:
+            if len(cols) < 10:
                 continue
-            try:
-                # 欄位順序依期交所格式：日期,契約,到期月,開盤,最高,最低,收盤,漲跌,漲跌%,成交量,結算價,未平倉
-                name = cols[1] if len(cols) > 1 else ''
-                vol  = safe_float(cols[9]) if len(cols) > 9 else None
-                price = safe_float(cols[6]) if len(cols) > 6 else None
-                oi   = safe_float(cols[11]) if len(cols) > 11 else None
-                if not name or vol is None:
-                    continue
-                records.append({
-                    'code':          cols[1],
-                    'name':          name,
-                    'volume':        vol,
-                    'price':         price,
-                    'open_interest': oi,
-                })
-            except Exception:
+            name = cols[1] if len(cols) > 1 else ''
+            vol  = safe_float(cols[9]) if len(cols) > 9 else None
+            price = safe_float(cols[6]) if len(cols) > 6 else None
+            oi   = safe_float(cols[11]) if len(cols) > 11 else None
+            if not name or vol is None:
                 continue
-        print(f'[API-2] 解析 {len(records)} 筆')
+            records.append({'code': cols[1], 'name': name, 'volume': vol,
+                            'price': price, 'open_interest': oi})
         return records
     except Exception as e:
-        print(f'[API-2] 失敗：{e}')
+        print(f'  [API-2] 失敗：{e}')
         return []
 
 
-# ── 方法三：期交所另一個公開JSON端點 ──────────────────────
-def fetch_taifex_alt(date_str):
-    """第三備用：期交所 JSON 格式日行情"""
-    date_nodash = date_str.replace('-', '')
-    urls = [
-        f'https://opendata.taifex.com.tw/v1/DailyFuturesDate?MarketCode=0&Date={date_nodash}',
-        f'https://opendata.taifex.com.tw/v1/DailyFutures?Date={date_nodash}',
-    ]
-    for url in urls:
-        print(f'[API-3] 嘗試：{url}')
-        try:
-            resp = requests.get(url, headers=HEADERS, timeout=30)
-            if resp.status_code == 200:
-                data = resp.json()
-                if isinstance(data, list) and len(data) > 0:
-                    print(f'[API-3] 取得 {len(data)} 筆，第一筆欄位：{list(data[0].keys())}')
-                    records = []
-                    for row in data:
-                        # 動態找成交量欄位
-                        vol = None
-                        for k in row:
-                            if 'vol' in k.lower() or '成交量' in k or 'volume' in k.lower():
-                                vol = safe_float(row[k])
-                                if vol is not None:
-                                    break
-                        name = ''
-                        for k in row:
-                            if 'name' in k.lower() or '名稱' in k or '契約' in k:
-                                name = str(row[k]).strip()
-                                if name:
-                                    break
-                        if not name or vol is None:
-                            continue
-                        records.append({
-                            'code':          row.get('CommodityID', ''),
-                            'name':          name,
-                            'volume':        vol,
-                            'price':         None,
-                            'open_interest': None,
-                        })
-                    if records:
-                        return records
-        except Exception as e:
-            print(f'[API-3] {url} 失敗：{e}')
-    return []
+def fetch_one_day(date_str):
+    """嘗試所有 API 取得單日資料，失敗回傳空清單"""
+    records = fetch_taifex_opendata(date_str)
+    if not records:
+        records = fetch_taifex_csv(date_str)
+    return records
 
 
 # ── 計算量增排行 ──────────────────────────────────────────
@@ -229,7 +183,6 @@ def calc_ranking(today_records, yesterday_records):
         yest  = yest_map.get(key)
         vol_t = r.get('volume') or 0
         vol_y = (yest.get('volume') or 0) if yest else 0
-
         vol_chg = round((vol_t - vol_y) / vol_y * 100, 2) if vol_y > 0 else None
         result.append({**r, 'volume_change_pct': vol_chg, 'price_change_pct': None})
 
@@ -250,53 +203,73 @@ def update_index(date):
     idx['dates']        = dates
     idx['last_updated'] = now_str()
     save_json(idx_path, idx)
-    print(f'[索引] 已更新，共 {len(dates)} 天記錄')
 
 
-def main():
-    ensure_dir()
-    today = today_str()
-    print(f'\n{"="*50}')
-    print(f' 個股期貨爬蟲 v2  {now_str()}')
-    print(f'{"="*50}')
-
-    # 依序嘗試三個方法
-    records = fetch_taifex_opendata(today)
-    if not records:
-        records = fetch_taifex_csv(today)
-    if not records:
-        records = fetch_taifex_alt(today)
+# ── 處理單一日期 ──────────────────────────────────────────
+def process_date(date_str, prev_date_str=None):
+    print(f'\n── {date_str} ──────────────────────')
+    records = fetch_one_day(date_str)
 
     if not records:
-        print('[中止] 三個 API 都無法取得資料')
-        print('可能原因：今日為非交易日，或 API 尚未更新（盤後約 17:30 更新）')
-        # 非交易日不算失敗，正常結束
-        sys.exit(0)
+        print(f'  → 無資料（非交易日或 API 未更新），跳過')
+        return False
 
-    # 儲存原始資料
-    raw_path = os.path.join(DATA_DIR, f'raw_{today}.json')
-    save_json(raw_path, {'date': today, 'fetched': now_str(), 'records': records})
-    print(f'[儲存] 原始資料 {len(records)} 筆 → {raw_path}')
+    # 儲存原始
+    raw_path = os.path.join(DATA_DIR, f'raw_{date_str}.json')
+    save_json(raw_path, {'date': date_str, 'fetched': now_str(), 'records': records})
+    print(f'  → 原始資料 {len(records)} 筆')
 
-    # 讀昨日資料
-    tz = datetime.timezone(datetime.timedelta(hours=8))
-    yest = (datetime.datetime.now(tz) - datetime.timedelta(days=1)).strftime('%Y-%m-%d')
-    yest_data = load_json(os.path.join(DATA_DIR, f'raw_{yest}.json'))
-    yest_records = yest_data.get('records', []) if yest_data else []
+    # 讀前一日
+    yest_records = []
+    if prev_date_str:
+        yest_data = load_json(os.path.join(DATA_DIR, f'raw_{prev_date_str}.json'))
+        if yest_data:
+            yest_records = yest_data.get('records', [])
 
     # 計算排行
     ranking = calc_ranking(records, yest_records)
-    print(f'[排行] 前 {len(ranking)} 名：')
-    for i, r in enumerate(ranking[:5], 1):
+    rank_path = os.path.join(DATA_DIR, f'ranking_{date_str}.json')
+    save_json(rank_path, {'date': date_str, 'fetched': now_str(), 'ranking': ranking})
+
+    print(f'  → 排行前3：', end='')
+    for r in ranking[:3]:
         p = f"{r['volume_change_pct']:+.1f}%" if r['volume_change_pct'] is not None else 'N/A'
-        print(f'  {i}. {r["name"]}  量增{p}  成交{r.get("volume")}')
+        print(f'{r["name"]}({p})', end='  ')
+    print()
 
-    rank_path = os.path.join(DATA_DIR, f'ranking_{today}.json')
-    save_json(rank_path, {'date': today, 'fetched': now_str(), 'ranking': ranking})
-    print(f'[儲存] 排行 → {rank_path}')
+    update_index(date_str)
+    return True
 
-    update_index(today)
-    print(f'\n✅ 完成！\n')
+
+# ── 主程式 ────────────────────────────────────────────────
+def main():
+    ensure_dir()
+    print(f'\n{"="*50}')
+    print(f' 個股期貨爬蟲 v3  {now_str()}')
+    print(f'{"="*50}')
+
+    # 讀取環境變數決定模式
+    backfill_start = os.environ.get('BACKFILL_START', '').strip()
+    backfill_end   = os.environ.get('BACKFILL_END', '').strip()
+
+    if backfill_start and backfill_end:
+        # ── 補抓模式 ──
+        print(f'[補抓模式] {backfill_start} ~ {backfill_end}')
+        dates = get_weekdays(backfill_start, backfill_end)
+        print(f'[補抓模式] 共 {len(dates)} 個工作日：{dates}')
+        for i, date_str in enumerate(dates):
+            prev = dates[i-1] if i > 0 else None
+            process_date(date_str, prev)
+            time.sleep(1)  # 避免 API 請求太快
+    else:
+        # ── 每日模式（今天）──
+        today = today_str()
+        tz    = datetime.timezone(datetime.timedelta(hours=8))
+        yest  = (datetime.datetime.now(tz) - datetime.timedelta(days=1)).strftime('%Y-%m-%d')
+        print(f'[每日模式] 擷取 {today}')
+        process_date(today, yest)
+
+    print(f'\n✅ 全部完成！\n')
 
 
 if __name__ == '__main__':
