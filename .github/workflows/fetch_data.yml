@@ -1,0 +1,39 @@
+name: 每日擷取個股期貨資料
+
+on:
+  schedule:
+    # 每天台灣時間 18:05（UTC+8），轉換為 UTC 10:05
+    - cron: '5 10 * * 1-5'   # 週一到週五（排除週末）
+  workflow_dispatch:           # 允許手動在 GitHub 網頁觸發
+
+jobs:
+  fetch-data:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write          # 允許推送資料回 repository
+
+    steps:
+      - name: 取出程式碼
+        uses: actions/checkout@v4
+
+      - name: 設定 Python 環境
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安裝套件
+        run: |
+          pip install requests beautifulsoup4 lxml
+
+      - name: 執行爬蟲
+        run: |
+          python scripts/fetch_data.py
+
+      - name: 推送資料回 GitHub
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/
+          # 只有在有變更時才 commit
+          git diff --staged --quiet || git commit -m "📊 自動更新：$(date +'%Y-%m-%d') 個股期貨資料"
+          git push
